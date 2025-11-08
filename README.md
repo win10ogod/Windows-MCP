@@ -31,6 +31,69 @@ mcp-name: io.github.CursorTouch/Windows-MCP
 - Try out 🪟[Windows-Use](https://github.com/CursorTouch/Windows-Use)!!, an agent built using Windows-MCP.
 - Windows-MCP is now featured as Desktop Extension in `Claude Desktop`.
 
+- New high‑FPS capture sidecar (DXGI first; fallbacks) with MCP tools: `Frame-Stream-Start`/`Stop`/`Get`.
+- New SendInput‑first backend via IbInputSimulator (default `IbSendInit("AnyDriver")`), with SendInput/PyAutoGUI fallback.
+- Per‑game input rate limiter; MCP tool: `Input-RateLimiter-Config`.
+- Reflex layer scaffolding for Strategy A; MCP tools: `Reflex-Load`, `Reflex-Step`.
+
+### Configuration (Environment Variables)
+- `WINDOWS_MCP_INPUT_BACKEND` (default `ibsim`): `ibsim` or `pyautogui`.
+- `WINDOWS_MCP_INPUT_DRIVER` (default `AnyDriver`): IbInputSimulator driver (e.g., `AnyDriver`, `Logitech`, `LogitechGHubNew`, `Razer`, `DD`, `MouClassInputInjection`).
+- `WINDOWS_MCP_RATE_MOVE_HZ`/`_MAX_DELTA`/`_SMOOTH`/`_CPS`/`_KPS`: rate limits.
+- `WINDOWS_MCP_FRAMESTREAM_AUTOSTART` (0/1), `WINDOWS_MCP_FRAMESTREAM_FPS`, `WINDOWS_MCP_FRAMESTREAM_DOWNSCALE`, `WINDOWS_MCP_FRAMESTREAM_REGION` (`l,t,r,b`).
+- `WINDOWS_MCP_VISION_WORLD_ONLY` (1/0), `WINDOWS_MCP_VISION_MODEL`。
+- `WINDOWS_MCP_VISION_IMGSZ` (default `640`): letterbox size for YOLO input。
+- `WINDOWS_MCP_PG_FAILSAFE` (0/1), `WINDOWS_MCP_PG_PAUSE` (sec)。
+- `WINDOWS_MCP_OUTPUT_DIR`: directory to save annotated images/frames (defaults to `%LOCALAPPDATA%/Windows-MCP/outputs`)。
+
+Example (Codex/Claude Desktop env):
+```json
+{
+  "WINDOWS_MCP_INPUT_BACKEND": "ibsim",
+  "WINDOWS_MCP_INPUT_DRIVER": "AnyDriver",
+  "WINDOWS_MCP_FRAMESTREAM_AUTOSTART": "1",
+  "WINDOWS_MCP_FRAMESTREAM_FPS": "120",
+  "WINDOWS_MCP_RATE_MOVE_HZ": "120",
+  "WINDOWS_MCP_RATE_SMOOTH": "0.15"
+}
+```
+
+### Vision Assistance (YOLO)
+
+Optional computer‑vision tools detect on‑screen objects. Default backend is standard Ultralytics YOLO; YOLO‑World is supported when enabled.
+
+- `Vision-Detect-Tool`: object detection on a desktop screenshot.
+  - Backend: standard YOLO by default. Set `WINDOWS_MCP_VISION_WORLD_ONLY=1` to use YOLO‑World and accept open‑vocabulary `prompts`.
+  - Optional params: `imgsz` (default 640), `region=[l,t,r,b]` for ROI。會自動 letterbox 並將方框映射回整個螢幕座標。
+  - Output options: `return_mode=attachment|data_uri|both`, `save=true`, `filename="name.png"`（檔案會存到 `WINDOWS_MCP_OUTPUT_DIR`）。
+- `Vision-Annotate-Tool`: store VLM/client annotations back to the server for the active window.
+- `Vision-Get-Annotations-Tool` / `Vision-Clear-Annotations-Tool`.
+
+Environment variables:
+- `WINDOWS_MCP_VISION_WORLD_ONLY` (default `0`)
+- `WINDOWS_MCP_VISION_MODEL` (default `yolov8n.pt` for standard YOLO; use a `*-world*.pt` to enable YOLO‑World)
+- `WINDOWS_MCP_VISION_MODEL_STD` (default `yolov8n.pt`): model used when falling back from YOLO‑World to standard YOLO
+- `WINDOWS_MCP_VISION_MODEL_DIRS`: `;`‑separated search paths for model files
+
+Install (optional extras):
+
+```bash
+# Standard YOLO only
+uv sync --extra vision
+
+# YOLO‑World support (adds CLIP)
+uv sync --extra vision_world
+
+# High‑FPS capture only (DXGI + fallbacks)
+uv sync --extra capture
+
+# Everything
+uv sync --extra full
+
+# If extras are not available in your setup, install CLIP manually once:
+# uv pip install "git+https://github.com/ultralytics/CLIP.git#egg=clip" ftfy regex tqdm
+```
+
 ### Supported Operating Systems
 
 - Windows 7
@@ -131,7 +194,15 @@ Go to `Settings->Connectors->Add Connector->Advanced`
     "<path to the windows-mcp directory>",
     "run",
     "main.py"
-  ]
+  ],
+  "env": {
+    "WINDOWS_MCP_INPUT_BACKEND": "ibsim",
+    "WINDOWS_MCP_INPUT_DRIVER": "AnyDriver",
+    "WINDOWS_MCP_FRAMESTREAM_AUTOSTART": "1",
+    "WINDOWS_MCP_FRAMESTREAM_FPS": "120",
+    "WINDOWS_MCP_RATE_MOVE_HZ": "120",
+    "WINDOWS_MCP_RATE_SMOOTH": "0.15"
+  }
 }
 ```
 
@@ -174,7 +245,15 @@ cd Windows-MCP
         "<path to the windows-mcp directory>",
         "run",
         "main.py"
-      ]
+      ],
+      "env": {
+        "WINDOWS_MCP_INPUT_BACKEND": "ibsim",
+        "WINDOWS_MCP_INPUT_DRIVER": "AnyDriver",
+        "WINDOWS_MCP_FRAMESTREAM_AUTOSTART": "1",
+        "WINDOWS_MCP_FRAMESTREAM_FPS": "120",
+        "WINDOWS_MCP_RATE_MOVE_HZ": "120",
+        "WINDOWS_MCP_RATE_SMOOTH": "0.15"
+      }
     }
   }
 }
@@ -213,7 +292,15 @@ cd Windows-MCP
         "<path to the windows-mcp directory>",
         "run",
         "main.py"
-      ]
+      ],
+      "env": {
+        "WINDOWS_MCP_INPUT_BACKEND": "ibsim",
+        "WINDOWS_MCP_INPUT_DRIVER": "AnyDriver",
+        "WINDOWS_MCP_FRAMESTREAM_AUTOSTART": "1",
+        "WINDOWS_MCP_FRAMESTREAM_FPS": "120",
+        "WINDOWS_MCP_RATE_MOVE_HZ": "120",
+        "WINDOWS_MCP_RATE_SMOOTH": "0.15"
+      }
     }
   }
 }
@@ -249,6 +336,14 @@ args=[
   "run",
   "main.py"
 ]
+env={
+  WINDOWS_MCP_INPUT_BACKEND="ibsim",
+  WINDOWS_MCP_INPUT_DRIVER="AnyDriver",
+  WINDOWS_MCP_FRAMESTREAM_AUTOSTART="1",
+  WINDOWS_MCP_FRAMESTREAM_FPS="120",
+  WINDOWS_MCP_RATE_MOVE_HZ="120",
+  WINDOWS_MCP_RATE_SMOOTH="0.15"
+}
 ```
 
   5. Rerun Codex CLI in terminal. Enjoy 🥳

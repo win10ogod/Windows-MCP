@@ -29,7 +29,25 @@
         "main.py"
       ],
       "env": {
-        
+        "WINDOWS_MCP_INPUT_BACKEND": "ibsim",
+        "WINDOWS_MCP_INPUT_DRIVER": "AnyDriver",
+        "WINDOWS_MCP_RATE_MOVE_HZ": "120",
+        "WINDOWS_MCP_RATE_MAX_DELTA": "60",
+        "WINDOWS_MCP_RATE_SMOOTH": "0.0",
+        "WINDOWS_MCP_RATE_CPS": "8.0",
+        "WINDOWS_MCP_RATE_KPS": "12.0",
+
+        "WINDOWS_MCP_FRAMESTREAM_AUTOSTART": "0",
+        "WINDOWS_MCP_FRAMESTREAM_FPS": "60",
+        "WINDOWS_MCP_FRAMESTREAM_DOWNSCALE": "1.0",
+        "WINDOWS_MCP_FRAMESTREAM_REGION": "",
+
+        "WINDOWS_MCP_VISION_WORLD_ONLY": "0",
+        "WINDOWS_MCP_VISION_MODEL": "yolov8n.pt",
+
+        "WINDOWS_MCP_PG_FAILSAFE": "0",
+        "WINDOWS_MCP_PG_PAUSE": "1.0",
+        "WINDOWS_MCP_OUTPUT_DIR": ""
       }
     }
   },
@@ -78,6 +96,31 @@
       "name":"Scrape-Tool",
       "description":"Fetch and convert webpage content to markdown format. Provide full URL including protocol (http/https). Returns structured text content suitable for analysis."
     }
+    ,
+    {
+      "name": "Vision-Detect-Tool",
+      "description": "Run YOLO-World detection on a desktop screenshot. Accepts prompts (string or list), optional imgsz and region=[l,t,r,b]. Returns boxes and annotated image."
+    },
+    {
+      "name": "Vision-Annotate-Tool",
+      "description": "Store VLM/client-provided annotations {label, bbox, score?} for the active window to aid subsequent actions."
+    },
+    {
+      "name": "Vision-Get-Annotations-Tool",
+      "description": "Retrieve stored annotations for the active window."
+    },
+    {
+      "name": "Vision-Clear-Annotations-Tool",
+      "description": "Clear stored annotations for the active window, or all when clear_all is true."
+    }
+    ,
+    { "name": "Frame-Stream-Start", "description": "Start a high-FPS capture stream using DXGI if available. region=[l,t,r,b], downscale in 0..1." },
+    { "name": "Frame-Stream-Stop", "description": "Stop the high-FPS capture stream." },
+    { "name": "Frame-Stream-Get", "description": "Get latest frame as image. return_mode: attachment|data_uri; supports saving to file." },
+    { "name": "Output-Dir-Info", "description": "Return directory used for saving outputs; override via WINDOWS_MCP_OUTPUT_DIR." },
+    { "name": "Input-RateLimiter-Config", "description": "Configure per-game input rate limiting (move_hz, max_delta, smooth, clicks/keys per sec)." },
+    { "name": "Reflex-Load", "description": "Load or reset the fast reflex policy (module+object), defaults to NoOp." },
+    { "name": "Reflex-Step", "description": "Run one reflex step on latest frame and execute actions." }
   ],
   "tools_generated": true,
   "compatibility": {
