@@ -9,6 +9,8 @@ from markdownify import markdownify
 from fuzzywuzzy import process
 from psutil import Process
 from time import sleep
+import math
+import random
 from io import BytesIO
 from PIL import Image
 import win32process
@@ -40,13 +42,189 @@ import uiautomation as uia
 import pyautogui as pg
 
 pg.FAILSAFE=False
-pg.PAUSE=1.0
+pg.PAUSE=0.0
 
 class Desktop:
     def __init__(self):
         self.encoding=getpreferredencoding()
         self.tree=Tree(self)
         self.desktop_state=None
+        self._debug = os.getenv('WINDOWS_MCP_INPUT_DEBUG','0').lower() in ['1','true','yes','on']
+        # Input backend: prefer IbInputSimulator via AHK v2 (Logitech), fallback to pyautogui
+        try:
+            from src.input.backend import build_backend
+            preferred=os.getenv('WINDOWS_MCP_INPUT_BACKEND','ibsim')
+            # Default to AnyDriver per IbInputSimulator docs
+            driver=os.getenv('WINDOWS_MCP_INPUT_DRIVER','AnyDriver')
+            self.input_backend=build_backend(preferred=preferred, driver=driver)
+            logger.info(f"Input backend: {self.input_backend.info()}")
+        except Exception as e:
+            logger.warning(f"Failed to init input backend, falling back to pyautogui: {e}")
+            self.input_backend=None
+        # Rate limiter (per game adjustable)
+        try:
+            from src.input.rate import RateLimiter, RateConfig
+            def _f(name, default, cast):
+                v=os.getenv(name)
+                try:
+                    return cast(v) if v is not None else default
+                except Exception:
+                    return default
+            cfg=RateConfig(
+                mouse_move_hz=_f('WINDOWS_MCP_RATE_MOVE_HZ', 120.0, float),
+                mouse_max_delta=_f('WINDOWS_MCP_RATE_MAX_DELTA', 60, int),
+                mouse_smooth=_f('WINDOWS_MCP_RATE_SMOOTH', 0.0, float),
+                clicks_per_sec=_f('WINDOWS_MCP_RATE_CPS', 8.0, float),
+                keys_per_sec=_f('WINDOWS_MCP_RATE_KPS', 12.0, float),
+            )
+            self.rate_limiter = RateLimiter(cfg)
+        except Exception:
+            self.rate_limiter = None
+        # Vision memory for client-provided annotations
+        try:
+            from src.vision.memory import VisionMemory
+            self.vision_memory = VisionMemory()
+        except Exception:
+            self.vision_memory = None
+        # Humanized movement toggles (single-monitor only)
+        try:
+            def _b(name: str, default: bool) -> bool:
+                v = os.getenv(name, '1' if default else '0').lower()
+                return v in ('1','true','yes','on')
+            def _f(name: str, default: float) -> float:
+                try:
+                    return float(os.getenv(name, str(default)))
+                except Exception:
+                    return default
+            self._human_move = _b('WINDOWS_MCP_HUMAN_MOVE', True)
+            self._human_curve = max(0.0, min(1.0, _f('WINDOWS_MCP_HUMAN_CURVE', 0.6)))
+            self._human_jitter = max(0.0, min(1.0, _f('WINDOWS_MCP_HUMAN_JITTER', 0.1)))
+            self._human_min_dur = max(0.01, _f('WINDOWS_MCP_HUMAN_MIN_DUR', 0.08))
+            self._human_max_dur = max(self._human_min_dur, _f('WINDOWS_MCP_HUMAN_MAX_DUR', 0.6))
+        except Exception:
+            self._human_move = True
+            self._human_curve = 0.6
+            self._human_jitter = 0.1
+            self._human_min_dur = 0.08
+            self._human_max_dur = 0.6
+
+    def _single_monitor_move(self, x: int, y: int) -> bool:
+        """Stable (and optionally humanized) absolute move for single-monitor setups.
+
+        Returns True if moved and verified; False if not single-monitor or if
+        verification failed so caller can fall back to general path.
+        """
+        try:
+            user32 = ctypes.windll.user32
+            SM_CMONITORS = 80
+            if user32.GetSystemMetrics(SM_CMONITORS) != 1:
+                return False
+            # Clamp to visible screen bounds
+            SM_CXSCREEN = 0
+            SM_CYSCREEN = 1
+            sw = max(1, int(user32.GetSystemMetrics(SM_CXSCREEN)))
+            sh = max(1, int(user32.GetSystemMetrics(SM_CYSCREEN)))
+            tx = max(0, min(int(x), sw - 1))
+            ty = max(0, min(int(y), sh - 1))
+            # Get current position
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+            pt = POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            cx, cy = int(pt.x), int(pt.y)
+            if cx == tx and cy == ty:
+                return True
+            if self._debug:
+                logger.info(f"Move request (single-monitor): target=({tx},{ty}), current=({cx}, {cy})")
+            # Humanized curve path (if enabled)
+            if self._human_move:
+                dx, dy = tx - cx, ty - cy
+                d = math.hypot(dx, dy)
+                if d <= 0:
+                    return True
+                # Duration scales with distance; clamp
+                dur = min(self._human_max_dur, max(self._human_min_dur, 0.06 + d / 1400.0))
+                hz = 120.0
+                if self.rate_limiter and getattr(self.rate_limiter, 'cfg', None):
+                    try:
+                        hz = float(self.rate_limiter.cfg.mouse_move_hz) or 120.0
+                    except Exception:
+                        hz = 120.0
+                steps = max(4, int(dur * hz))
+                # Orthonormal vector for lateral deviation
+                ox, oy = (0.0, 0.0)
+                if d > 0:
+                    ux, uy = dx / d, dy / d
+                    ox, oy = -uy, ux
+                amp = min(60.0, d * 0.25) * self._human_curve
+                jitter_amp = 0.75 * self._human_jitter
+                def ease(t: float) -> float:
+                    return 3*t*t - 2*t*t*t  # smoothstep
+                for i in range(1, steps + 1):
+                    t = i / steps
+                    u = ease(t)
+                    lateral = math.sin(math.pi * u)
+                    jx = (random.random() - 0.5) * 2.0 * jitter_amp
+                    jy = (random.random() - 0.5) * 2.0 * jitter_amp
+                    px = int(round(cx + dx * u + ox * lateral * amp + jx))
+                    py = int(round(cy + dy * u + oy * lateral * amp + jy))
+                    # Bound each step
+                    px = max(0, min(px, sw - 1))
+                    py = max(0, min(py, sh - 1))
+                    user32.SetCursorPos(px, py)
+                    # pace by hz
+                    pg.sleep(max(0.0, 1.0 / hz))
+                # Final verify after path
+                user32.GetCursorPos(ctypes.byref(pt))
+                if (pt.x, pt.y) == (tx, ty):
+                    if self._debug:
+                        logger.info(f"Move verify (single-monitor): now=({pt.x},{pt.y})")
+                    return True
+                # If small mismatch, snap once
+                user32.SetCursorPos(tx, ty)
+                user32.GetCursorPos(ctypes.byref(pt))
+                if (pt.x, pt.y) == (tx, ty):
+                    if self._debug:
+                        logger.info(f"Move verify (single-monitor): now=({pt.x},{pt.y})")
+                    return True
+                # Fall through to non-human immediate path
+            # Non-human immediate path or human verification fallback
+            for _ in range(3):
+                user32.SetCursorPos(tx, ty)
+                user32.GetCursorPos(ctypes.byref(pt))
+                if (pt.x, pt.y) == (tx, ty):
+                    if self._debug:
+                        logger.info(f"Move verify (single-monitor): now=({pt.x},{pt.y})")
+                    return True
+                if pt.x == 0 and pt.y == 0 and (tx != 0 or ty != 0):
+                    pg.sleep(0.01)
+                    continue
+                pg.sleep(0.01)
+            # Fallback A: pyautogui
+            try:
+                pg.moveTo(tx, ty, duration=0.0)
+                user32.GetCursorPos(ctypes.byref(pt))
+                if (pt.x, pt.y) == (tx, ty):
+                    if self._debug:
+                        logger.info(f"Move verify (pyautogui fallback): now=({pt.x},{pt.y})")
+                    return True
+            except Exception:
+                pass
+            # Fallback B: backend then force
+            try:
+                if self.input_backend:
+                    self.input_backend.move(tx, ty)
+                    user32.SetCursorPos(tx, ty)
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    if (pt.x, pt.y) == (tx, ty):
+                        if self._debug:
+                            logger.info(f"Move verify (backend fallback): now=({pt.x},{pt.y})")
+                        return True
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
         
     def get_state(self,use_vision:bool=False,as_bytes:bool=False)->DesktopState:
         active_app,apps=self.get_apps()
@@ -80,7 +258,7 @@ class Desktop:
                     continue
                 return app
         except Exception as ex:
-            print(f"Error: {ex}")
+            logger.error(f"Error: {ex}")
         return None
     
     def get_app_status(self,control:uia.Control)->Status:
@@ -94,8 +272,18 @@ class Desktop:
             return Status.HIDDEN
     
     def get_cursor_location(self)->tuple[int,int]:
+        # Use Win32 API to get global (virtual desktop) coordinates
+        try:
+            class POINT(ctypes.Structure):
+                _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+            pt = POINT()
+            ok = ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            if ok:
+                return (int(pt.x), int(pt.y))
+        except Exception:
+            pass
         position=pg.position()
-        return (position.x,position.y)
+        return (position.x, position.y)
     
     def get_element_under_cursor(self)->uia.Control:
         return uia.ControlFromCursor()
@@ -254,24 +442,74 @@ class Desktop:
         
     def click(self,loc:tuple[int,int],button:str='left',clicks:int=2):
         x,y=loc
-        pg.click(x,y,button=button,clicks=clicks,duration=0.1)
+        # Avoid redundant reposition when already at target
+        try:
+            cx, cy = self.get_cursor_location()
+            if (cx, cy) != (int(x), int(y)):
+                self._single_monitor_move(x, y)
+        except Exception:
+            self._single_monitor_move(x, y)
+        if self.rate_limiter:
+            self.rate_limiter.sleep_until_ready('click')
+        if self.input_backend:
+            if self._debug:
+                logger.info(f"Click request: ({x},{y}), button={button}, clicks={clicks}")
+            self.input_backend.click(x,y,button=button,clicks=clicks)
+        else:
+            pg.click(x,y,button=button,clicks=clicks,duration=0.1)
 
     def type(self,loc:tuple[int,int],text:str,caret_position:Literal['start','end','none']='none',clear:Literal['true','false']='false',press_enter:Literal['true','false']='false'):
         x,y=loc
-        pg.leftClick(x,y)
+        # Avoid redundant reposition when already at target
+        try:
+            cx, cy = self.get_cursor_location()
+            if (cx, cy) != (int(x), int(y)):
+                self._single_monitor_move(x, y)
+        except Exception:
+            self._single_monitor_move(x, y)
+        if self.rate_limiter:
+            self.rate_limiter.sleep_until_ready('move')
+        if self.input_backend:
+            self.input_backend.click(x,y,button='left',clicks=1)
+        else:
+            pg.leftClick(x,y)
         if caret_position == 'start':
-            pg.press('home')
+            if self.rate_limiter:
+                self.rate_limiter.sleep_until_ready('key')
+            if self.input_backend:
+                self.input_backend.hotkey('home')
+            else:
+                pg.press('home')
         elif caret_position == 'end':
-            pg.press('end')
+            if self.rate_limiter:
+                self.rate_limiter.sleep_until_ready('key')
+            if self.input_backend:
+                self.input_backend.hotkey('end')
+            else:
+                pg.press('end')
         else:
             pass
         if clear=='true':
-            pg.sleep(0.5)
-            pg.hotkey('ctrl','a')
-            pg.press('backspace')
-        pg.typewrite(text,interval=0.02)
+            pg.sleep(0.1)
+            if self.rate_limiter:
+                self.rate_limiter.sleep_until_ready('key')
+            if self.input_backend:
+                self.input_backend.hotkey('ctrl+a')
+                self.input_backend.hotkey('backspace')
+            else:
+                pg.hotkey('ctrl','a')
+                pg.press('backspace')
+        if self.input_backend:
+            self.input_backend.send_text(text)
+        else:
+            pg.typewrite(text,interval=0.02)
         if press_enter=='true':
-            pg.press('enter')
+            if self.rate_limiter:
+                self.rate_limiter.sleep_until_ready('key')
+            if self.input_backend:
+                self.input_backend.hotkey('enter')
+            else:
+                pg.press('enter')
 
     def scroll(self,loc:tuple[int,int]=None,type:Literal['horizontal','vertical']='vertical',direction:Literal['up','down','left','right']='down',wheel_times:int=1)->str|None:
         if loc:
@@ -286,20 +524,35 @@ class Desktop:
                     case _:
                         return 'Invalid direction. Use "up" or "down".'
             case 'horizontal':
-                match direction:
-                    case 'left':
+                # Prefer OS horizontal wheel events; fallback to Shift+Wheel
+                try:
+                    user32 = ctypes.windll.user32
+                    MOUSEEVENTF_HWHEEL = 0x01000
+                    WHEEL_DELTA = 120
+                    delta = WHEEL_DELTA * max(1, int(wheel_times))
+                    if direction == 'left':
+                        delta = -delta
+                    elif direction == 'right':
+                        delta = +delta
+                    else:
+                        return 'Invalid direction. Use "left" or "right".'
+                    # Issue one event per wheel_times chunk (most apps scale themselves)
+                    user32.mouse_event(MOUSEEVENTF_HWHEEL, 0, 0, delta, 0)
+                except Exception:
+                    # Fallback: Shift + vertical wheel to simulate horizontal
+                    if direction == 'left':
                         pg.keyDown('Shift')
-                        pg.sleep(0.05)
+                        pg.sleep(0.01)
                         uia.WheelUp(wheel_times)
-                        pg.sleep(0.05)
+                        pg.sleep(0.01)
                         pg.keyUp('Shift')
-                    case 'right':
+                    elif direction == 'right':
                         pg.keyDown('Shift')
-                        pg.sleep(0.05)
+                        pg.sleep(0.01)
                         uia.WheelDown(wheel_times)
-                        pg.sleep(0.05)
+                        pg.sleep(0.01)
                         pg.keyUp('Shift')
-                    case _:
+                    else:
                         return 'Invalid direction. Use "left" or "right".'
             case _:
                 return 'Invalid type. Use "horizontal" or "vertical".'
@@ -307,31 +560,191 @@ class Desktop:
     
     def drag(self,loc:tuple[int,int]):
         x,y=loc
-        pg.sleep(0.5)
-        pg.dragTo(x,y,duration=0.6)
+        pg.sleep(0.1)
+        if self.rate_limiter:
+            self.rate_limiter.sleep_until_ready('move')
+        # Single-monitor humanized drag using OS events if possible
+        try:
+            user32 = ctypes.windll.user32
+            SM_CMONITORS = 80
+            if user32.GetSystemMetrics(SM_CMONITORS) == 1:
+                # Start from real current pos
+                class POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+                pt = POINT()
+                user32.GetCursorPos(ctypes.byref(pt))
+                sx, sy = int(pt.x), int(pt.y)
+                # Press left button down
+                MOUSEEVENTF_LEFTDOWN = 0x0002
+                MOUSEEVENTF_LEFTUP = 0x0004
+                if self._debug:
+                    logger.info(f"Drag request: from=({sx}, {sy}) to={x,y}")
+                user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+                # Move along humanized path to target
+                # Reuse _single_monitor_move's human path logic but keep button pressed
+                # Generate a local path without snapping at the end
+                cx, cy = sx, sy
+                tx, ty = int(x), int(y)
+                dx, dy = tx - cx, ty - cy
+                d = math.hypot(dx, dy)
+                if d > 0:
+                    dur = min(self._human_max_dur, max(self._human_min_dur, 0.06 + d / 1400.0))
+                    hz = 120.0
+                    if self.rate_limiter and getattr(self.rate_limiter, 'cfg', None):
+                        try:
+                            hz = float(self.rate_limiter.cfg.mouse_move_hz) or 120.0
+                        except Exception:
+                            hz = 120.0
+                    steps = max(4, int(dur * hz))
+                    ux, uy = (dx / d, dy / d) if d > 0 else (0.0, 0.0)
+                    ox, oy = -uy, ux
+                    amp = min(60.0, d * 0.25) * self._human_curve
+                    jitter_amp = 0.75 * self._human_jitter
+                    def ease(t: float) -> float:
+                        return 3*t*t - 2*t*t*t
+                    # Screen bounds
+                    SM_CXSCREEN = 0
+                    SM_CYSCREEN = 1
+                    sw = max(1, int(user32.GetSystemMetrics(SM_CXSCREEN)))
+                    sh = max(1, int(user32.GetSystemMetrics(SM_CYSCREEN)))
+                    for i in range(1, steps + 1):
+                        t = i / steps
+                        u = ease(t)
+                        lateral = math.sin(math.pi * u)
+                        jx = (random.random() - 0.5) * 2.0 * jitter_amp
+                        jy = (random.random() - 0.5) * 2.0 * jitter_amp
+                        px = int(round(cx + dx * u + ox * lateral * amp + jx))
+                        py = int(round(cy + dy * u + oy * lateral * amp + jy))
+                        px = max(0, min(px, sw - 1))
+                        py = max(0, min(py, sh - 1))
+                        user32.SetCursorPos(px, py)
+                        pg.sleep(max(0.0, 1.0 / hz))
+                # Release
+                user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+                return
+        except Exception:
+            pass
+        # Fallback to backend/pyautogui default drag
+        if self.input_backend:
+            # Ensure current position is accurately reflected before starting
+            current=self.get_cursor_location()
+            self._single_monitor_move(current[0], current[1])
+            nx, ny = x, y
+            if self._debug:
+                logger.info(f"Drag request: from={current} to={x,y}")
+            self.input_backend.drag(current[0], current[1], nx, ny)
+        else:
+            pg.dragTo(x,y,duration=0.6)
 
     def move(self,loc:tuple[int,int]):
         x,y=loc
-        pg.moveTo(x,y,duration=0.1)
+        if self.rate_limiter:
+            self.rate_limiter.sleep_until_ready('move')
+        # Single-monitor fast path: use OS absolute pixels and skip backend to avoid driver quirks
+        try:
+            user32 = ctypes.windll.user32
+            SM_CMONITORS = 80
+            if user32.GetSystemMetrics(SM_CMONITORS) == 1:
+                # Clamp to visible screen bounds to avoid OS clamping to (0,0)
+                SM_CXSCREEN = 0
+                SM_CYSCREEN = 1
+                sw = max(1, int(user32.GetSystemMetrics(SM_CXSCREEN)))
+                sh = max(1, int(user32.GetSystemMetrics(SM_CYSCREEN)))
+                tx = max(0, min(int(x), sw - 1))
+                ty = max(0, min(int(y), sh - 1))
+                if self._debug:
+                    current = self.get_cursor_location()
+                    logger.info(f"Move request (single-monitor): target=({tx},{ty}), current={current}")
+                # Try up to 3 times: SetCursorPos -> verify
+                class POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+                pt = POINT()
+                for attempt in range(3):
+                    user32.SetCursorPos(tx, ty)
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    if (pt.x, pt.y) == (tx, ty):
+                        if self._debug:
+                            logger.info(f"Move verify (single-monitor): now=({pt.x},{pt.y})")
+                        return
+                    # If verify failed and landed at (0,0) unexpectedly, wait briefly and retry
+                    if pt.x == 0 and pt.y == 0 and (tx != 0 or ty != 0):
+                        pg.sleep(0.01)
+                        continue
+                    # Minor mismatch: short sleep and retry
+                    pg.sleep(0.01)
+                # Fallback A: try PyAutoGUI absolute move (should also be pixels on single monitor)
+                try:
+                    pg.moveTo(tx, ty, duration=0.0)
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    if (pt.x, pt.y) == (tx, ty):
+                        if self._debug:
+                            logger.info(f"Move verify (pyautogui fallback): now=({pt.x},{pt.y})")
+                        return
+                except Exception:
+                    pass
+                # Fallback B: as a last resort, delegate to backend then force OS position once more
+                try:
+                    if self.input_backend:
+                        self.input_backend.move(tx, ty)
+                        user32.SetCursorPos(tx, ty)
+                        user32.GetCursorPos(ctypes.byref(pt))
+                        if (pt.x, pt.y) == (tx, ty):
+                            if self._debug:
+                                logger.info(f"Move verify (backend fallback): now=({pt.x},{pt.y})")
+                            return
+                except Exception:
+                    pass
+                # Give up single-monitor path; fall back to general path below
+        except Exception:
+            # Fall back to backend path if any OS call fails
+            pass
+
+        if self.input_backend:
+            if self._debug:
+                current = self.get_cursor_location()
+                logger.info(f"Move request: target=({x},{y}), current={current}")
+            self.input_backend.move(x,y)
+            # Verify OS cursor position; force if mismatch
+            try:
+                class POINT(ctypes.Structure):
+                    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+                pt = POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                if (pt.x, pt.y) != (int(x), int(y)):
+                    ctypes.windll.user32.SetCursorPos(int(x), int(y))
+                    # Re-check once
+                    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                    if self._debug:
+                        logger.info(f"Move verify-correct: requested=({x},{y}) now=({pt.x},{pt.y})")
+            except Exception:
+                pass
+        else:
+            pg.moveTo(x,y,duration=0.1)
 
     def shortcut(self,shortcut:str):
-        shortcut=shortcut.split('+')
-        if len(shortcut)>1:
-            pg.hotkey(*shortcut)
+        if self.rate_limiter:
+            self.rate_limiter.sleep_until_ready('key')
+        if self.input_backend:
+            self.input_backend.hotkey(shortcut)
         else:
-            pg.press(''.join(shortcut))
+            shortcut=shortcut.split('+')
+            if len(shortcut)>1:
+                pg.hotkey(*shortcut)
+            else:
+                pg.press(''.join(shortcut))
 
     def multi_select(self,elements:list[tuple[int,int]|int]):
         pg.keyDown('ctrl')
         for element in elements:
             if isinstance(element,tuple):
                 x,y=element
-                pg.click(x,y,duration=0.2)
-                pg.sleep(0.5)
+                # Use stabilized click path
+                self.click((x,y),button='left',clicks=1)
+                pg.sleep(0.1)
             else:
                 x,y=self.get_coordinates_from_label(element)
-                pg.click(x,y,duration=0.2)
-                pg.sleep(0.5)
+                self.click((x,y),button='left',clicks=1)
+                pg.sleep(0.1)
         pg.keyUp('ctrl')
     
     def multi_edit(self,elements:list[tuple[int,int,str]|tuple[int,str]]):
@@ -382,7 +795,7 @@ class Desktop:
                     size=self.get_app_size(element)
                     apps.append(App(name=element.Name, depth=depth, status=status,size=size,handle=element.NativeWindowHandle,process_id=element.ProcessId))
         except Exception as ex:
-            print(f"Error: {ex}")
+            logger.error(f"Error: {ex}")
             apps = []
 
         active_app=self.get_active_app(apps)
@@ -460,9 +873,24 @@ class Desktop:
 
     def get_screenshot(self,scale:float=0.7)->Image.Image:
         screenshot=pg.screenshot()
-        size=(screenshot.width*scale, screenshot.height*scale)
-        screenshot.thumbnail(size=size, resample=Image.Resampling.LANCZOS)
+        # Ensure integer size for Pillow APIs
+        w = max(1, int(round(screenshot.width * float(scale))))
+        h = max(1, int(round(screenshot.height * float(scale))))
+        if (w, h) != (screenshot.width, screenshot.height):
+            screenshot = screenshot.resize((w, h), resample=Image.Resampling.LANCZOS)
         return screenshot
+
+    def get_active_handle(self) -> int | None:
+        """Top-level window handle of foreground app, if available."""
+        if self.desktop_state is None:
+            try:
+                # Build a minimal state to compute active app
+                active_app, apps = self.get_apps()
+                self.desktop_state = DesktopState(apps=apps, active_app=active_app, screenshot=None, tree_state=self.tree.get_state(uia.GetRootControl()))
+            except Exception:
+                return None
+        active = self.desktop_state.active_app
+        return active.handle if active else None
     
     @contextmanager
     def auto_minimize(self):
